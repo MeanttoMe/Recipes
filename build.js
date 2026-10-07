@@ -4,7 +4,6 @@ const https = require('https');
 
 function notionRequest(path, method, body){
   const key = process.env.NOTION_API_KEY;
-  const dbId = process.env.NOTION_DB_ID;
   if(!key) return Promise.resolve(null);
   return new Promise((resolve)=>{
     const opts={
@@ -19,7 +18,18 @@ function notionRequest(path, method, body){
     };
     const req=https.request(opts, res=>{
       let data=''; res.on('data', d=>data+=d);
-      res.on('end',()=>{ try{ resolve(JSON.parse(data)); }catch(e){ console.log('parse fail', data.slice(0,300)); resolve({results:[]}); } });
+      res.on('end',()=>{ 
+        try{ 
+          const j = JSON.parse(data);
+          if(j.object==='error'){
+            console.log('NOTION API ERROR:', path, j.code, j.message);
+          }
+          resolve(j); 
+        }catch(e){ 
+          console.log('parse fail for', path, data.slice(0,500)); 
+          resolve({results:[]}); 
+        } 
+      });
     });
     req.on('error',(e)=>{ console.log('req error', e.message); resolve({results:[]}); });
     if(body) req.write(JSON.stringify(body));
@@ -50,10 +60,16 @@ function getFiles(prop) {
   return f.file ? f.file.url : (f.external ? f.external.url : '');
 }
 function blockToText(block){
-  const t = block[block.type];
-  if(!t) return '';
-  if(!t.rich_text) return '';
-  return t.rich_text.map(x=>x.plain_text).join('');
+  try{
+    const type = block.type;
+    const data = block[type];
+    if(!data) return '';
+    if(type==='child_database') return '';
+    if(data.rich_text){
+      return data.rich_text.map(x=>x.plain_text).join('');
+    }
+    return '';
+  }catch(e){ return ''; }
 }
 
 async function main(){
@@ -61,17 +77,23 @@ async function main(){
   const dbId = process.env.NOTION_DB_ID;
   const apiKey = process.env.NOTION_API_KEY;
   if(dbId && apiKey){
-    console.log('Fetching DB...');
+    console.log('Fetching DB...', dbId.slice(0,8));
     const data = await notionRequest('/v1/databases/'+dbId+'/query', 'POST', {page_size:100});
     if(data && data.results){
       console.log('Found', data.results.length, 'pages, fetching page contents...');
-      // fetch blocks for each page
       for(let i=0;i<data.results.length;i++){
         const page = data.results[i];
         console.log(`[${i+1}/${data.results.length}] fetching blocks for ${page.id.slice(0,8)}...`);
         const blocks = await notionRequest('/v1/blocks/'+page.id+'/children?page_size=100', 'GET', null);
+        if(blocks.object==='error'){
+          console.log('  !! API Error:', blocks.code, '-', blocks.message);
+          page._pageContent='';
+          continue;
+        }
         let text='';
-        for(const b of (blocks.results||[])){
+        const results = blocks.results||[];
+        console.log(`  -> API returned ${results.length} blocks`);
+        for(const b of results){
           const txt=blockToText(b);
           if(!txt) continue;
           if(b.type==='heading_1') text+='\n# '+txt+'\n';
@@ -79,13 +101,15 @@ async function main(){
           else if(b.type==='heading_3') text+='\n### '+txt+'\n';
           else if(b.type==='bulleted_list_item') text+='- '+txt+'\n';
           else if(b.type==='numbered_list_item') text+='• '+txt+'\n';
-          else text+=txt+'\n\n';
+          else text+=txt+'\n';
         }
         page._pageContent=text;
         console.log('  ->', text.length, 'chars');
       }
       raw = data;
       try{ fs.writeFileSync('recipes.json', JSON.stringify(data),'utf8'); }catch(e){}
+    } else {
+      console.log('DB fetch failed:', JSON.stringify(data||{}).slice(0,1000));
     }
   }
   if(!raw){
@@ -104,18 +128,8 @@ async function main(){
     let ingredients = extractText(getProp(page,'재료'));
     let steps = extractText(getProp(page,'조리법'));
     const pageContent = page._pageContent || '';
-
-    // If property empty, parse from pageContent (for Jjambbong style)
-    if(!ingredients && pageContent){
-      // try find [야채], [해물] etc - just use first part as ingredients
-      if(pageContent.includes('야채') || pageContent.includes('해물') || pageContent.includes('양념')){
-        ingredients = pageContent;
-      }
-    }
-    if(!steps && pageContent){
-      steps = pageContent;
-    }
-
+    if(!ingredients && pageContent) ingredients = pageContent;
+    if(!steps && pageContent) steps = pageContent;
     const coup1 = extractText(getProp(page,'쿠팡제품1')) || getFiles(getProp(page,'쿠팡제품1'));
     const coup2 = extractText(getProp(page,'쿠팡제품2')) || getFiles(getProp(page,'쿠팡제품2'));
     const coup3 = extractText(getProp(page,'쿠팡제품3')) || getFiles(getProp(page,'쿠팡제품3'));
@@ -137,107 +151,7 @@ async function main(){
   if (!fs.existsSync('dist')) fs.mkdirSync('dist',{recursive:true});
   fs.writeFileSync('dist/site-data.json', JSON.stringify(recipes,null,2),'utf8');
 
-  const finalHtml = `<!DOCTYPE html>
-<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>나의 레시피 북</title>
-<style>
-*{box-sizing:border-box} body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; margin:0; background:#fafaf7; color:#111}
-header{text-align:center; padding:40px 20px 20px} header h1{font-size:32px; margin:0} header p{color:#666; margin-top:8px}
-.controls{max-width:1100px; margin:0 auto; padding:0 20px 20px; display:flex; gap:10px; flex-wrap:wrap}
-.controls input, .controls select{padding:10px 14px; border:1px solid #ddd; border-radius:10px; font-size:14px} .controls input{flex:1; min-width:200px}
-.grid{max-width:1100px; margin:0 auto; padding:0 20px 80px; display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:20px}
-.card{background:white; border-radius:16px; overflow:hidden; box-shadow:0 2px 12px rgba(0,0,0,.06); display:flex; flex-direction:column; cursor:pointer; transition:transform .15s, box-shadow .15s}
-.card:hover{transform:translateY(-4px); box-shadow:0 8px 24px rgba(0,0,0,.12)}
-.card-cover{height:180px; background:#f1f1ef; background-size:cover; background-position:center; display:flex; align-items:center; justify-content:center; font-size:48px}
-.card-body{padding:16px}
-.badge{display:inline-block; font-size:12px; padding:4px 8px; border-radius:20px; background:#f0f0f0; margin-right:6px; margin-bottom:6px}
-.badge.time{background:#e8f5e9} .badge.chef{background:#e3f2fd} .badge.diff{background:#fff3e0}
-.title{font-size:18px; font-weight:700; margin:8px 0; line-height:1.3}
-.tags{margin-top:10px}
-.modal-overlay{display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:1000; align-items:center; justify-content:center; padding:20px}
-.modal-overlay.open{display:flex}
-.modal{background:white; border-radius:20px; max-width:720px; width:100%; max-height:90vh; overflow-y:auto; position:relative}
-.modal-cover{height:260px; background:#eee; background-size:cover; background-position:center}
-.modal-close{position:absolute; top:12px; right:12px; width:36px; height:36px; border-radius:50%; background:white; border:none; font-size:20px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.15)}
-.modal-body{padding:24px} .modal-body h2{margin:0 0 12px; font-size:24px}
-.modal-section{margin-top:20px} .modal-section h3{font-size:16px; margin:0 0 8px; border-left:4px solid #111; padding-left:8px}
-.modal-section pre{white-space:pre-wrap; font-family:inherit; background:#fafaf7; padding:12px; border-radius:10px; font-size:14px; line-height:1.6}
-.coupang a{display:inline-block; margin:6px 10px 0 0; font-size:13px; color:#fff; background:#0073e9; padding:8px 14px; border-radius:8px; text-decoration:none}
-.empty{grid-column:1/-1; text-align:center; padding:60px; color:#999}
-</style></head>
-<body>
-<header><h1>🍳 나의 레시피 북</h1><p>Notion에서 자동으로 업데이트됩니다 - 총 <span id="count">0</span>개 · 카드를 클릭해보세요!</p></header>
-<div class="controls"><input id="search" placeholder="요리명, 재료, 셰프 검색..."><select id="filterChef"><option value="">세프/출처 전체</option></select><select id="filterTime"><option value="">소요시간 전체</option></select><select id="filterStatus"><option value="">상태 전체</option></select></div>
-<div class="grid" id="grid"></div>
-<div class="modal-overlay" id="modal"><div class="modal"><button class="modal-close" onclick="closeModal()">✕</button><div class="modal-cover" id="mCover"></div><div class="modal-body"><div id="mBadges"></div><h2 id="mTitle"></h2><div id="mTags"></div><div class="modal-section"><h3>🥕 재료</h3><pre id="mIng"></pre></div><div class="modal-section"><h3>👩‍🍳 조리법 & 상세 내용</h3><pre id="mSteps"></pre></div><div class="modal-section" id="mFullWrap" style="display:none"><h3>📝 Notion 본문 전체</h3><pre id="mFull"></pre></div><div class="modal-section" id="mCoupangWrap"><h3>🛒 쿠팡 제품</h3><div id="mCoupang" class="coupang"></div></div><div style="margin-top:20px"><a id="mNotion" target="_blank" style="color:#666; font-size:13px">Notion에서 열기 →</a></div></div></div></div>
-<script>
-let data=[];
-async function load(){
-  try{
-    const res = await fetch('site-data.json?v='+Date.now());
-    data = await res.json();
-  }catch(e){ data=[]; }
-  initFilters(); render();
-}
-function initFilters(){
-  const chefs=[...new Set(data.map(d=>d.chef).filter(Boolean))];
-  const times=[...new Set(data.map(d=>d.time).filter(Boolean))];
-  const statuses=[...new Set(data.map(d=>d.status).filter(Boolean))];
-  const add=(sel,list)=>{ list.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; sel.appendChild(o); }); };
-  add(document.getElementById('filterChef'),chefs);
-  add(document.getElementById('filterTime'),times);
-  add(document.getElementById('filterStatus'),statuses);
-}
-function render(){
-  const q=document.getElementById('search').value.toLowerCase();
-  const chefF=document.getElementById('filterChef').value;
-  const timeF=document.getElementById('filterTime').value;
-  const statusF=document.getElementById('filterStatus').value;
-  const grid=document.getElementById('grid');
-  let filtered=data.filter(d=>{
-    const matchQ=!q||d.title.toLowerCase().includes(q)||(d.ingredients&&d.ingredients.toLowerCase().includes(q))||(d.fullContent&&d.fullContent.toLowerCase().includes(q))||(d.chef&&d.chef.toLowerCase().includes(q));
-    return matchQ && (!chefF||d.chef===chefF) && (!timeF||d.time===timeF) && (!statusF||d.status===statusF);
-  });
-  document.getElementById('count').textContent=filtered.length;
-  if(filtered.length===0){ grid.innerHTML='<div class=empty>레시피가 없습니다.</div>'; return; }
-  grid.innerHTML=filtered.map(r=>{
-    const idx=data.indexOf(r);
-    return \`<div class="card" onclick="openModal(\${idx})">\${r.cover ? \`<div class="card-cover" style="background-image:url('\${r.cover}')"></div>\` : \`<div class="card-cover">🍳</div>\`}<div class="card-body"><div>\${r.time? \`<span class="badge time">⏱ \${r.time}</span>\`:''} \${r.chef? \`<span class="badge chef">👨‍🍳 \${r.chef}</span>\`:''} \${r.difficulty? \`<span class="badge diff">⭐ \${r.difficulty}</span>\`:''} \${r.status? \`<span class="badge">\${r.status}</span>\`:''}</div><div class="title">\${r.title}</div><div class="tags">\${(r.categories||[]).map(c=>\`<span class="badge">\${c}</span>\`).join('')} \${(r.tags||[]).map(t=>\`<span class="badge" style="background:#f3e5f5">\${t}</span>\`).join('')}</div></div></div>\`;
-  }).join('');
-}
-function openModal(idx){
-  const r=data[idx];
-  const coverEl=document.getElementById('mCover');
-  coverEl.style.backgroundImage=r.cover? \`url('\${r.cover}')\`:'';
-  coverEl.innerHTML=r.cover?'':'<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:64px">🍳</div>';
-  document.getElementById('mBadges').innerHTML=\`\${r.time? \`<span class="badge time">⏱ \${r.time}</span>\`:''} \${r.chef? \`<span class="badge chef">👨‍🍳 \${r.chef}</span>\`:''} \${r.difficulty? \`<span class="badge diff">⭐ \${r.difficulty}</span>\`:''} \${r.status? \`<span class="badge">\${r.status}</span>\`:''}\`;
-  document.getElementById('mTitle').textContent=r.title;
-  document.getElementById('mTags').innerHTML=(r.categories||[]).map(c=>\`<span class="badge">\${c}</span>\`).join('') + (r.tags||[]).map(t=>\`<span class="badge" style="background:#f3e5f5">\${t}</span>\`).join('');
-  // smart split
-  let ing = r.ingredients || '';
-  let steps = r.steps || '';
-  if(r.fullContent && r.fullContent.length > 10){
-    // if fullContent contains both, use it for both
-    if(!ing || ing.length < 10) ing = r.fullContent;
-    if(!steps || steps.length < 10) steps = r.fullContent;
-  }
-  document.getElementById('mIng').textContent=ing || '재료 정보 없음 - Notion 페이지 본문을 확인하세요';
-  document.getElementById('mSteps').textContent=steps || '조리법 정보 없음';
-  const cw=document.getElementById('mCoupangWrap');
-  const c=document.getElementById('mCoupang');
-  if(r.coupang&&r.coupang.length){ c.innerHTML=r.coupang.map((u,i)=>\`<a href="\${u}" target="_blank">🛒 쿠팡 제품 \${i+1} 보기</a>\`).join(''); cw.style.display='block'; } else { cw.style.display='none'; }
-  document.getElementById('mNotion').href=r.url;
-  document.getElementById('modal').classList.add('open');
-}
-function closeModal(){ document.getElementById('modal').classList.remove('open'); }
-document.getElementById('modal').addEventListener('click', e=>{ if(e.target.id==='modal') closeModal(); });
-document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
-document.getElementById('search').addEventListener('input', render);
-document.getElementById('filterChef').addEventListener('change', render);
-document.getElementById('filterTime').addEventListener('change', render);
-document.getElementById('filterStatus').addEventListener('change', render);
-load();
-</script></body></html>`;
+  const finalHtml = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>나의 레시피 북</title><style>*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:#fafaf7;color:#111}header{text-align:center;padding:40px 20px 20px}header h1{font-size:32px;margin:0}header p{color:#666;margin-top:8px}.controls{max-width:1100px;margin:0 auto;padding:0 20px 20px;display:flex;gap:10px;flex-wrap:wrap}.controls input,.controls select{padding:10px 14px;border:1px solid #ddd;border-radius:10px;font-size:14px}.controls input{flex:1;min-width:200px}.grid{max-width:1100px;margin:0 auto;padding:0 20px 80px;display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}.card{background:white;border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);display:flex;flex-direction:column;cursor:pointer;transition:transform .15s,box-shadow .15s}.card:hover{transform:translateY(-4px);box-shadow:0 8px 24px rgba(0,0,0,.12)}.card-cover{height:180px;background:#f1f1ef;background-size:cover;background-position:center;display:flex;align-items:center;justify-content:center;font-size:48px}.card-body{padding:16px}.badge{display:inline-block;font-size:12px;padding:4px 8px;border-radius:20px;background:#f0f0f0;margin-right:6px;margin-bottom:6px}.badge.time{background:#e8f5e9}.badge.chef{background:#e3f2fd}.badge.diff{background:#fff3e0}.title{font-size:18px;font-weight:700;margin:8px 0;line-height:1.3}.tags{margin-top:10px}.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;padding:20px}.modal-overlay.open{display:flex}.modal{background:white;border-radius:20px;max-width:720px;width:100%;max-height:90vh;overflow-y:auto;position:relative}.modal-cover{height:260px;background:#eee;background-size:cover;background-position:center}.modal-close{position:absolute;top:12px;right:12px;width:36px;height:36px;border-radius:50%;background:white;border:none;font-size:20px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.15)}.modal-body{padding:24px}.modal-body h2{margin:0 0 12px;font-size:24px}.modal-section{margin-top:20px}.modal-section h3{font-size:16px;margin:0 0 8px;border-left:4px solid #111;padding-left:8px}.modal-section pre{white-space:pre-wrap;font-family:inherit;background:#fafaf7;padding:12px;border-radius:10px;font-size:14px;line-height:1.6}.coupang a{display:inline-block;margin:6px 10px 0 0;font-size:13px;color:#fff;background:#0073e9;padding:8px 14px;border-radius:8px;text-decoration:none}.empty{grid-column:1/-1;text-align:center;padding:60px;color:#999}</style></head><body><header><h1>🍳 나의 레시피 북</h1><p>Notion에서 자동으로 업데이트됩니다 - 총 <span id="count">0</span>개 · 카드를 클릭해보세요!</p></header><div class="controls"><input id="search" placeholder="요리명, 재료, 셰프 검색..."><select id="filterChef"><option value="">세프/출처 전체</option></select><select id="filterTime"><option value="">소요시간 전체</option></select><select id="filterStatus"><option value="">상태 전체</option></select></div><div class="grid" id="grid"></div><div class="modal-overlay" id="modal"><div class="modal"><button class="modal-close" onclick="closeModal()">✕</button><div class="modal-cover" id="mCover"></div><div class="modal-body"><div id="mBadges"></div><h2 id="mTitle"></h2><div id="mTags"></div><div class="modal-section"><h3>🥕 재료</h3><pre id="mIng"></pre></div><div class="modal-section"><h3>👩‍🍳 조리법 & 상세 내용</h3><pre id="mSteps"></pre></div><div class="modal-section" id="mCoupangWrap"><h3>🛒 쿠팡 제품</h3><div id="mCoupang" class="coupang"></div></div><div style="margin-top:20px"><a id="mNotion" target="_blank" style="color:#666;font-size:13px">Notion에서 열기 →</a></div></div></div></div><script>let data=[];async function load(){try{const res=await fetch('site-data.json?v='+Date.now());data=await res.json();}catch(e){data=[];}initFilters();render();}function initFilters(){const chefs=[...new Set(data.map(d=>d.chef).filter(Boolean))];const times=[...new Set(data.map(d=>d.time).filter(Boolean))];const statuses=[...new Set(data.map(d=>d.status).filter(Boolean))];const add=(sel,list)=>{list.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;sel.appendChild(o);});};add(document.getElementById('filterChef'),chefs);add(document.getElementById('filterTime'),times);add(document.getElementById('filterStatus'),statuses);}function render(){const q=document.getElementById('search').value.toLowerCase();const chefF=document.getElementById('filterChef').value;const timeF=document.getElementById('filterTime').value;const statusF=document.getElementById('filterStatus').value;const grid=document.getElementById('grid');let filtered=data.filter(d=>{const matchQ=!q||d.title.toLowerCase().includes(q)||(d.ingredients&&d.ingredients.toLowerCase().includes(q))||(d.fullContent&&d.fullContent.toLowerCase().includes(q))||(d.chef&&d.chef.toLowerCase().includes(q));return matchQ && (!chefF||d.chef===chefF) && (!timeF||d.time===timeF) && (!statusF||d.status===statusF);});document.getElementById('count').textContent=filtered.length;if(filtered.length===0){grid.innerHTML='<div class=empty>레시피가 없습니다.</div>';return;}grid.innerHTML=filtered.map(r=>{const idx=data.indexOf(r);return \`<div class="card" onclick="openModal(\${idx})">\${r.cover ? \`<div class="card-cover" style="background-image:url('\${r.cover}')"></div>\` : \`<div class="card-cover">🍳</div>\`}<div class="card-body"><div>\${r.time? \`<span class="badge time">⏱ \${r.time}</span>\`:''} \${r.chef? \`<span class="badge chef">👨‍🍳 \${r.chef}</span>\`:''} \${r.difficulty? \`<span class="badge diff">⭐ \${r.difficulty}</span>\`:''} \${r.status? \`<span class="badge">\${r.status}</span>\`:''}</div><div class="title">\${r.title}</div><div class="tags">\${(r.categories||[]).map(c=>\`<span class="badge">\${c}</span>\`).join('')} \${(r.tags||[]).map(t=>\`<span class="badge" style="background:#f3e5f5">\${t}</span>\`).join('')}</div></div></div>\`;}).join('');}function openModal(idx){const r=data[idx];const coverEl=document.getElementById('mCover');coverEl.style.backgroundImage=r.cover? \`url('\${r.cover}')\` : '';coverEl.innerHTML=r.cover?'':'<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:64px">🍳</div>';document.getElementById('mBadges').innerHTML=\`\${r.time? \`<span class="badge time">⏱ \${r.time}</span>\`:''} \${r.chef? \`<span class="badge chef">👨‍🍳 \${r.chef}</span>\`:''} \${r.difficulty? \`<span class="badge diff">⭐ \${r.difficulty}</span>\`:''} \${r.status? \`<span class="badge">\${r.status}</span>\`:''}\`;document.getElementById('mTitle').textContent=r.title;document.getElementById('mTags').innerHTML=(r.categories||[]).map(c=>\`<span class="badge">\${c}</span>\`).join('') + (r.tags||[]).map(t=>\`<span class="badge" style="background:#f3e5f5">\${t}</span>\`).join('');document.getElementById('mIng').textContent=r.ingredients||'재료 정보 없음 - Notion 페이지 본문을 확인하세요';document.getElementById('mSteps').textContent=r.steps||r.fullContent||'조리법 정보 없음';const cw=document.getElementById('mCoupangWrap');const c=document.getElementById('mCoupang');if(r.coupang&&r.coupang.length){c.innerHTML=r.coupang.map((u,i)=>\`<a href="\${u}" target="_blank">🛒 쿠팡 제품 \${i+1} 보기</a>\`).join('');cw.style.display='block';}else{cw.style.display='none';}document.getElementById('mNotion').href=r.url;document.getElementById('modal').classList.add('open');}function closeModal(){document.getElementById('modal').classList.remove('open');}document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')closeModal();});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});document.getElementById('search').addEventListener('input',render);document.getElementById('filterChef').addEventListener('change',render);document.getElementById('filterTime').addEventListener('change',render);document.getElementById('filterStatus').addEventListener('change',render);load();<\/script></body></html>`;
   fs.writeFileSync('dist/index.html', finalHtml,'utf8');
   fs.writeFileSync('index.html', finalHtml,'utf8');
   console.log('done');
