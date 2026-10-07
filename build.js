@@ -2,7 +2,6 @@
 const fs = require('fs');
 
 function getProp(page, name) {
-  // 정확한 이름 + trim + 부분일치까지
   if (page.properties[name]) return page.properties[name];
   const key = Object.keys(page.properties).find(k => k.trim() === name.trim() || k.includes(name));
   return key ? page.properties[key] : null;
@@ -11,16 +10,10 @@ function extractText(prop) {
   if (!prop) return '';
   if (prop.type === 'title' && prop.title) return prop.title.map(t=>t.plain_text).join('\n');
   if (prop.type === 'rich_text' && prop.rich_text) return prop.rich_text.map(t=>t.plain_text).join('\n');
-  if (prop.type === 'text' && prop.text) return prop.text.map(t=>t.plain_text).join('\n'); // old API
   if (prop.type === 'select' && prop.select) return prop.select.name || '';
   if (prop.type === 'multi_select' && prop.multi_select) return prop.multi_select.map(s=>s.name).join(', ');
   if (prop.type === 'url' && prop.url) return prop.url;
-  if (prop.type === 'formula' && prop.formula) {
-    if (prop.formula.string) return prop.formula.string;
-    if (prop.formula.number) return String(prop.formula.number);
-  }
-  // fallback: any array with plain_text
-  if (Array.isArray(prop)) return prop.map(t=>t.plain_text||'').join('\n');
+  if (prop.type === 'formula' && prop.formula) return prop.formula.string || String(prop.formula.number||'');
   return '';
 }
 function getFiles(prop) {
@@ -34,14 +27,6 @@ async function main(){
   const raw = JSON.parse(fs.readFileSync('recipes.json','utf8'));
   const results = raw.results || [];
   console.log('Found', results.length);
-  // debug first page props
-  if(results[0]){
-    console.log('Props of first:', Object.keys(results[0].properties));
-    for(const k of Object.keys(results[0].properties)){
-      const p = results[0].properties[k];
-      console.log(k, 'type=', p.type, 'sample=', JSON.stringify(p).substring(0,200));
-    }
-  }
 
   const recipes = results.map(page=>{
     const title = extractText(getProp(page,'요리명')) || '제목 없음';
@@ -51,14 +36,19 @@ async function main(){
     const time = extractText(getProp(page,'소요시간'));
     const categories = (getProp(page,'카테고리')?.multi_select||[]).map(s=>s.name);
     const tags = (getProp(page,'태그')?.multi_select||[]).map(s=>s.name);
-    const ing = extractText(getProp(page,'재료'));
-    const steps = extractText(getProp(page,'조리법'));
+    const ingProp = extractText(getProp(page,'재료'));
+    const stepsProp = extractText(getProp(page,'조리법'));
+    const pageContent = page._pageContent || '';
+    // 재료/조리법이 비어있으면 본문에서 사용
+    const ingredients = ingProp || (pageContent.includes('재료') ? pageContent : '');
+    const steps = stepsProp || pageContent;
+    
     const coup1 = extractText(getProp(page,'쿠팡제품1'));
     const coup2 = extractText(getProp(page,'쿠팡제품2'));
     const coup3 = extractText(getProp(page,'쿠팡제품3'));
-    const imgProp = getFiles(getProp(page,'이미지')) || getFiles(getProp(page,'사진')) || getFiles(getProp(page,'Image'));
+    const imgProp = getFiles(getProp(page,'이미지')) || getFiles(getProp(page,'사진'));
     const cover = page.cover ? (page.cover.external?.url || page.cover.file?.url || '') : '';
-    console.log('Recipe', title, 'ing len', ing.length, 'steps len', steps.length);
+
     return {
       id: page.id,
       title,
@@ -68,8 +58,9 @@ async function main(){
       time,
       categories,
       tags,
-      ingredients: ing,
-      steps: steps,
+      ingredients: ingProp || pageContent.substring(0,500),
+      steps: stepsProp || pageContent,
+      fullContent: pageContent,
       coupang: [coup1,coup2,coup3].filter(Boolean),
       url: page.url,
       cover: cover || imgProp
@@ -78,10 +69,8 @@ async function main(){
 
   fs.mkdirSync('dist',{recursive:true});
   fs.writeFileSync('dist/site-data.json', JSON.stringify(recipes,null,2),'utf8');
-  console.log('Wrote', recipes.length);
+  console.log('Wrote', recipes.length, 'recipes');
 
-  const html = fs.readFileSync('index.html','utf8'); // reuse existing index.html template if exists? We'll generate new one
-  // Use the previous modal template
   const finalHtml = `<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -117,7 +106,7 @@ header{text-align:center; padding:40px 20px 20px} header h1{font-size:32px; marg
 <header><h1>🍳 나의 레시피 북</h1><p>Notion에서 자동으로 업데이트됩니다 - 총 <span id="count">0</span>개 · 카드를 클릭해보세요!</p></header>
 <div class="controls"><input id="search" placeholder="요리명, 재료, 셰프 검색..."><select id="filterChef"><option value="">세프/출처 전체</option></select><select id="filterTime"><option value="">소요시간 전체</option></select><select id="filterStatus"><option value="">상태 전체</option></select></div>
 <div class="grid" id="grid"></div>
-<div class="modal-overlay" id="modal"><div class="modal" id="modalBox"><button class="modal-close" onclick="closeModal()">✕</button><div class="modal-cover" id="mCover"></div><div class="modal-body"><div id="mBadges"></div><h2 id="mTitle"></h2><div id="mTags"></div><div class="modal-section"><h3>🥕 재료</h3><pre id="mIng"></pre></div><div class="modal-section"><h3>👩‍🍳 조리법</h3><pre id="mSteps"></pre></div><div class="modal-section" id="mCoupangWrap"><h3>🛒 쿠팡 제품</h3><div id="mCoupang" class="coupang"></div></div><div style="margin-top:20px"><a id="mNotion" target="_blank" style="color:#666; font-size:13px">Notion에서 열기 →</a></div></div></div></div>
+<div class="modal-overlay" id="modal"><div class="modal"><button class="modal-close" onclick="closeModal()">✕</button><div class="modal-cover" id="mCover"></div><div class="modal-body"><div id="mBadges"></div><h2 id="mTitle"></h2><div id="mTags"></div><div class="modal-section"><h3>🥕 재료</h3><pre id="mIng"></pre></div><div class="modal-section"><h3>👩‍🍳 조리법 & 상세 내용</h3><pre id="mSteps"></pre></div><div class="modal-section" id="mFullWrap"><h3>📝 Notion 페이지 전체 내용</h3><pre id="mFull"></pre></div><div class="modal-section" id="mCoupangWrap"><h3>🛒 쿠팡 제품</h3><div id="mCoupang" class="coupang"></div></div><div style="margin-top:20px"><a id="mNotion" target="_blank" style="color:#666; font-size:13px">Notion에서 열기 →</a></div></div></div></div>
 <script>
 let data=[];
 async function load(){
@@ -141,12 +130,12 @@ function render(){
   const statusF=document.getElementById('filterStatus').value;
   const grid=document.getElementById('grid');
   let filtered=data.filter(d=>{
-    const matchQ=!q||d.title.toLowerCase().includes(q)||(d.ingredients&&d.ingredients.toLowerCase().includes(q))||(d.tags&&d.tags.join(' ').toLowerCase().includes(q))||(d.chef&&d.chef.toLowerCase().includes(q));
+    const matchQ=!q||d.title.toLowerCase().includes(q)||(d.ingredients&&d.ingredients.toLowerCase().includes(q))||(d.fullContent&&d.fullContent.toLowerCase().includes(q))||(d.chef&&d.chef.toLowerCase().includes(q));
     return matchQ && (!chefF||d.chef===chefF) && (!timeF||d.time===timeF) && (!statusF||d.status===statusF);
   });
   document.getElementById('count').textContent=filtered.length;
   if(filtered.length===0){ grid.innerHTML='<div class=empty>레시피가 없습니다.</div>'; return; }
-  grid.innerHTML=filtered.map((r,i)=>{
+  grid.innerHTML=filtered.map(r=>{
     const idx=data.indexOf(r);
     return \`<div class="card" onclick="openModal(\${idx})">\${r.cover ? \`<div class="card-cover" style="background-image:url('\${r.cover}')"></div>\` : \`<div class="card-cover">🍳</div>\`}<div class="card-body"><div>\${r.time? \`<span class="badge time">⏱ \${r.time}</span>\`:''} \${r.chef? \`<span class="badge chef">👨‍🍳 \${r.chef}</span>\`:''} \${r.difficulty? \`<span class="badge diff">⭐ \${r.difficulty}</span>\`:''} \${r.status? \`<span class="badge">\${r.status}</span>\`:''}</div><div class="title">\${r.title}</div><div class="tags">\${(r.categories||[]).map(c=>\`<span class="badge">\${c}</span>\`).join('')} \${(r.tags||[]).map(t=>\`<span class="badge" style="background:#f3e5f5">\${t}</span>\`).join('')}</div></div></div>\`;
   }).join('');
@@ -159,8 +148,13 @@ function openModal(idx){
   document.getElementById('mBadges').innerHTML=\`\${r.time? \`<span class="badge time">⏱ \${r.time}</span>\`:''} \${r.chef? \`<span class="badge chef">👨‍🍳 \${r.chef}</span>\`:''} \${r.difficulty? \`<span class="badge diff">⭐ \${r.difficulty}</span>\`:''} \${r.status? \`<span class="badge">\${r.status}</span>\`:''}\`;
   document.getElementById('mTitle').textContent=r.title;
   document.getElementById('mTags').innerHTML=(r.categories||[]).map(c=>\`<span class="badge">\${c}</span>\`).join('') + (r.tags||[]).map(t=>\`<span class="badge" style="background:#f3e5f5">\${t}</span>\`).join('');
-  document.getElementById('mIng').textContent=r.ingredients||'재료 정보 없음 - Notion에서 재료를 입력해주세요';
-  document.getElementById('mSteps').textContent=r.steps||'조리법 정보 없음 - Notion에서 조리법을 입력해주세요';
+  document.getElementById('mIng').textContent=r.ingredients||'재료 정보 없음';
+  document.getElementById('mSteps').textContent=r.steps||'조리법 정보 없음';
+  const fullWrap=document.getElementById('mFullWrap');
+  if(r.fullContent && r.fullContent.length>10 && r.fullContent !== r.steps){
+    document.getElementById('mFull').textContent=r.fullContent;
+    fullWrap.style.display='block';
+  } else { fullWrap.style.display='none'; }
   const cw=document.getElementById('mCoupangWrap');
   const c=document.getElementById('mCoupang');
   if(r.coupang&&r.coupang.length){ c.innerHTML=r.coupang.map((u,i)=>\`<a href="\${u}" target="_blank">🛒 쿠팡 제품 \${i+1} 보기</a>\`).join(''); cw.style.display='block'; } else { cw.style.display='none'; }
@@ -178,7 +172,6 @@ load();
 </script>
 </body>
 </html>`;
-
   fs.writeFileSync('dist/index.html', finalHtml,'utf8');
   fs.writeFileSync('index.html', finalHtml,'utf8');
   console.log('done');
