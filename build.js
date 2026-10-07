@@ -2,7 +2,7 @@
 const fs = require('fs');
 const https = require('https');
 
-function notionRequest(path, method='GET', body=null){
+function notionRequest(path, method, body){
   const key = process.env.NOTION_API_KEY;
   const dbId = process.env.NOTION_DB_ID;
   if(!key || !dbId) return Promise.resolve(null);
@@ -19,9 +19,9 @@ function notionRequest(path, method='GET', body=null){
     };
     const req=https.request(opts, res=>{
       let data=''; res.on('data', d=>data+=d);
-      res.on('end',()=>{ try{ resolve(JSON.parse(data)); }catch(e){ resolve({results:[]}); } });
+      res.on('end',()=>{ try{ resolve(JSON.parse(data)); }catch(e){ console.log('parse fail', data.slice(0,200)); resolve({results:[]}); } });
     });
-    req.on('error',()=>resolve({results:[]}));
+    req.on('error',(e)=>{ console.log('req error', e); resolve({results:[]}); });
     if(body) req.write(JSON.stringify(body));
     req.end();
   });
@@ -51,23 +51,24 @@ function getFiles(prop) {
 }
 
 async function main(){
-  // 1. Try fetch Notion if keys exist
   let raw = null;
   const dbId = process.env.NOTION_DB_ID;
-  if(dbId && process.env.NOTION_API_KEY){
-    console.log('Fetching from Notion DB:', dbId);
-    const data = await notionRequest(`/v1/databases/${dbId}/query`, 'POST', {page_size:100});
-    if(data && data.results){
+  const apiKey = process.env.NOTION_API_KEY;
+  if(dbId && apiKey){
+    console.log('Fetching from Notion...');
+    const data = await notionRequest('/v1/databases/'+dbId+'/query', 'POST', {page_size:100});
+    if(data && data.results && data.results.length>0){
       console.log('Fetched', data.results.length);
       raw = data;
-      fs.writeFileSync('recipes.json', JSON.stringify(data),'utf8');
+      try{ fs.writeFileSync('recipes.json', JSON.stringify(data),'utf8'); }catch(e){}
+    } else {
+      console.log('Notion fetch empty or error', JSON.stringify(data||{}).slice(0,500));
     }
   }
-  // 2. fallback to local recipes.json
   if(!raw){
     try{
       raw = JSON.parse(fs.readFileSync('recipes.json','utf8'));
-      console.log('Loaded local recipes.json', raw.results?.length);
+      console.log('Loaded local recipes.json');
     }catch(e){
       console.log('No recipes.json, using empty');
       raw = {results:[]};
@@ -94,21 +95,19 @@ async function main(){
     return {
       id: page.id,
       title, difficulty, status, chef, time, categories, tags,
-      ingredients: ingredients || pageContent.slice(0,800),
-      steps: steps || pageContent,
-      fullContent: pageContent,
+      ingredients: ingredients || pageContent.slice(0,800) || '',
+      steps: steps || pageContent || '',
+      fullContent: pageContent || '',
       coupang: [coup1,coup2,coup3].filter(Boolean),
       url: page.url,
       cover: cover || imgProp
     };
   }).filter(r=>r.title!=='제목 없음');
 
+  console.log('Total recipes:', recipes.length);
   if (!fs.existsSync('dist')) fs.mkdirSync('dist',{recursive:true});
   fs.writeFileSync('dist/site-data.json', JSON.stringify(recipes,null,2),'utf8');
-  console.log('Wrote', recipes.length, 'recipes');
 
-  const html = fs.readFileSync('index.html','utf8').includes('나의 레시피 북') ? fs.readFileSync('index.html','utf8') : null;
-  // generate fresh html always
   const finalHtml = `<!DOCTYPE html>
 <html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>나의 레시피 북</title>
@@ -209,6 +208,6 @@ load();
 </script></body></html>`;
   fs.writeFileSync('dist/index.html', finalHtml,'utf8');
   fs.writeFileSync('index.html', finalHtml,'utf8');
-  console.log('done');
+  console.log('done - dist created');
 }
 main();
