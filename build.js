@@ -59,7 +59,6 @@ function getFiles(prop) {
   const f = prop.files[0];
   return f.file ? f.file.url : (f.external ? f.external.url : '');
 }
-
 function blockToText(block){
   try{
     const type = block.type;
@@ -71,15 +70,15 @@ function blockToText(block){
     return '';
   }catch(e){ return ''; }
 }
-
 async function fetchBlocksRecursive(blockId, depth=0){
+  if(!blockId) return '';
   const res = await notionRequest('/v1/blocks/'+blockId+'/children?page_size=100', 'GET', null);
-  if(!res || res.object==='error'){
+  if(!res || res.object==='error' || !res.results){
     return '';
   }
   let text='';
   const blocks = res.results||[];
-  if(depth===0) console.log(`    block ${blockId.slice(0,8)} has ${blocks.length} children`);
+  if(depth===0) console.log(`    -> fetched ${blocks.length} top-level blocks`);
   for(const b of blocks){
     const txt = blockToText(b);
     if(txt){
@@ -90,7 +89,6 @@ async function fetchBlocksRecursive(blockId, depth=0){
       else if(b.type==='numbered_list_item') text+='• '+txt+'\n';
       else text+=txt+'\n';
     }
-    // if block has children (column_list, column, toggle, etc), recurse
     if(b.has_children){
       const childText = await fetchBlocksRecursive(b.id, depth+1);
       if(childText) text+=childText+'\n';
@@ -103,24 +101,33 @@ async function main(){
   let raw = null;
   const dbId = process.env.NOTION_DB_ID;
   const apiKey = process.env.NOTION_API_KEY;
+  console.log('DB ID:', dbId);
   if(dbId && apiKey){
-    console.log('Fetching DB...', dbId.slice(0,8));
+    console.log('Fetching DB query...');
     const data = await notionRequest('/v1/databases/'+dbId+'/query', 'POST', {page_size:100});
     if(data && data.results){
-      console.log('Found', data.results.length, 'pages, fetching page contents (recursive)...');
+      console.log('Found', data.results.length, 'pages');
+      // Debug first page structure
+      if(data.results.length>0){
+        const first = data.results[0];
+        console.log('First result ID:', first.id);
+        console.log('First result properties keys:', Object.keys(first.properties||{}).slice(0,10));
+        console.log('DB ID == first page ID?', first.id===dbId, first.id.replace(/-/g,'')===dbId.replace(/-/g,''));
+      }
       for(let i=0;i<data.results.length;i++){
         const page = data.results[i];
-        const title = (page.properties?.['요리명']?.title?.[0]?.plain_text)||'no title';
-        console.log(`[${i+1}/${data.results.length}] ${title} - fetching blocks for ${page.id.slice(0,8)}...`);
+        const titleProp = getProp(page,'요리명');
+        const title = extractText(titleProp) || 'no title';
+        console.log(`[${i+1}/${data.results.length}] ${title} - page.id=${page.id.slice(0,8)}... fetching...`);
         const text = await fetchBlocksRecursive(page.id, 0);
         page._pageContent=text;
-        console.log('  ->', text.length, 'chars');
-        if(text.length>0) console.log('  preview:', text.slice(0,120).replace(/\n/g,' '));
+        console.log(`  -> ${text.length} chars`);
+        if(text.length>0) console.log('  preview:', text.slice(0,150).replace(/\n/g,' | '));
       }
       raw = data;
       try{ fs.writeFileSync('recipes.json', JSON.stringify(data),'utf8'); }catch(e){}
     } else {
-      console.log('DB fetch failed:', JSON.stringify(data||{}).slice(0,1000));
+      console.log('DB fetch failed:', JSON.stringify(data||{}).slice(0,2000));
     }
   }
   if(!raw){
