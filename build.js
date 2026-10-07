@@ -7,67 +7,134 @@ function notionRequest(path, method, body){
     const opts={hostname:'api.notion.com',path,method,headers:{'Authorization':'Bearer '+key,'Notion-Version':'2022-06-28','Content-Type':'application/json'}};
     const req=https.request(opts, res=>{
       let data=''; res.on('data', d=>data+=d);
-      res.on('end',()=>{ try{ const j=JSON.parse(data); if(j.object==='error') console.log('ERROR',path,j.code,j.message); resolve(j);}catch(e){ console.log('parse fail',data.slice(0,2000)); resolve({results:[]}); } });
+      res.on('end',()=>{ try{ const j=JSON.parse(data); if(j.object==='error') console.log('ERROR',path,j.code,j.message,JSON.stringify(j).slice(0,500)); resolve(j);}catch(e){ console.log('parse fail',data.slice(0,2000)); resolve({results:[]}); } });
     });
     req.on('error',(e)=>{ console.log('req error',e.message); resolve(null); });
     if(body) req.write(JSON.stringify(body));
     req.end();
   });
 }
-function getProp(page,name){ if(!page.properties) return null; if(page.properties[name]) return page.properties[name]; const k=Object.keys(page.properties).find(x=>x.trim()===name.trim()||x.includes(name)||name.includes(x)); return k? page.properties[k]:null; }
-function extractText(prop){
-  if(!prop) return '';
-  if(prop.type==='title'&&prop.title) return prop.title.map(t=>t.plain_text).join('\n');
-  if(prop.type==='rich_text'&&prop.rich_text) return prop.rich_text.map(t=>t.plain_text).join('\n');
-  if(prop.type==='select'&&prop.select) return prop.select.name||'';
-  if(prop.type==='multi_select'&&prop.multi_select) return prop.multi_select.map(s=>s.name).join(', ');
-  if(prop.type==='url'&&prop.url) return prop.url;
-  if(prop.type==='formula'&&prop.formula) return prop.formula.string||String(prop.formula.number||'');
-  return '';
+function blockToText(block){
+  try{
+    const t=block.type; const d=block[t]; if(!d) return '';
+    if(d.rich_text) return d.rich_text.map(x=>x.plain_text).join('');
+    if(t==='child_page') return d.title||'';
+    return '';
+  }catch(e){ return ''; }
 }
-function getFiles(prop){ if(!prop||prop.type!=='files'||!prop.files) return ''; if(prop.files.length===0) return ''; const f=prop.files[0]; return f.file?f.file.url:(f.external?f.external.url:''); }
+async function fetchAllBlocks(blockId, depth=0, visited=new Set()){
+  if(!blockId || visited.has(blockId)) return '';
+  visited.add(blockId);
+  let allText=''; let cursor=null;
+  do{
+    const path='/v1/blocks/'+blockId+'/children?page_size=100'+(cursor?'&start_cursor='+cursor:'');
+    const res=await notionRequest(path,'GET',null);
+    if(!res || res.object==='error' || !res.results){
+      if(res&&res.object==='error') console.log(`  !! blocks error ${blockId.slice(0,8)}: ${res.code} ${res.message}`);
+      break;
+    }
+    const blocks=res.results;
+    if(depth===0) console.log(`    -> got ${blocks.length} blocks for ${blockId.slice(0,8)} types: ${blocks.map(b=>b.type).join(',').slice(0,200)}`);
+    for(const b of blocks){
+      const txt=blockToText(b);
+      if(b.type==='child_page'){
+        // skip child pages when fetching a recipe page
+      } else {
+        if(txt){
+          if(b.type==='heading_1') allText+='\n# '+txt+'\n';
+          else if(b.type==='heading_2') allText+='\n## '+txt+'\n';
+          else if(b.type==='heading_3') allText+='\n### '+txt+'\n';
+          else if(b.type==='bulleted_list_item') allText+='- '+txt+'\n';
+          else if(b.type==='numbered_list_item') allText+=txt+'\n';
+          else if(b.type==='to_do') allText+='□ '+txt+'\n';
+          else if(b.type==='quote') allText+=`> ${txt}\n`;
+          else if(b.type==='toggle') allText+=`\n${txt}\n`;
+          else allText+=txt+'\n';
+        }
+      }
+      if(b.has_children){
+        const child=await fetchAllBlocks(b.id, depth+1, visited);
+        if(child) allText+=child+'\n';
+      }
+    }
+    cursor=res.has_more?res.next_cursor:null;
+    if(cursor) await new Promise(r=>setTimeout(r,150));
+  }while(cursor);
+  return allText;
+}
 
 async function main(){
-  const dbId=(process.env.NOTION_DB_ID||'').trim();
-  console.log('DB ID',dbId.slice(0,8));
-  let raw=null;
-  if(dbId){
-    const data=await notionRequest('/v1/databases/'+dbId+'/query','POST',{page_size:100});
-    if(data&&data.results){
-      console.log('Found',data.results.length,'pages');
-      for(let i=0;i<data.results.length;i++){
-        const page=data.results[i];
-        const title=extractText(getProp(page,'요리명'))||'no title';
-        const ing=extractText(getProp(page,'재료'));
-        const steps=extractText(getProp(page,'조리법'));
-        console.log(`[${i+1}/${data.results.length}] ${title}`);
-        console.log(`  재료 property: ${ing.length} chars ${ing.slice(0,100).replace(/\n/g,' | ')}`);
-        console.log(`  조리법 property: ${steps.length} chars ${steps.slice(0,100).replace(/\n/g,' | ')}`);
-        console.log(`  all props: ${Object.keys(page.properties).join(', ')}`);
+  const parentId = (process.env.NOTION_DB_ID||'').trim() || (process.env.NOTION_PARENT_PAGE_ID||'').trim();
+  const dbId = (process.env.NOTION_DB_ID||'').trim();
+  console.log('Using parent ID', parentId.slice(0,8), 'len', parentId.length);
+  // First try as database query (if it's a database)
+  let recipes=[];
+  const dbData = await notionRequest('/v1/databases/'+parentId+'/query','POST',{page_size:100});
+  if(dbData && dbData.object!=='error' && dbData.results && dbData.results.length>0){
+    console.log('It is a DATABASE, found', dbData.results.length, 'entries');
+    // check if properties have data
+    let hasPropsData=false;
+    for(const p of dbData.results){
+      const ing = p.properties?.['재료']?.rich_text?.[0]?.plain_text || '';
+      if(ing) hasPropsData=true;
+    }
+    console.log('Has props data?', hasPropsData);
+    if(!hasPropsData){
+      console.log('Database props empty, trying as PAGE with child pages...');
+    } else {
+      // use database mode
+      for(const page of dbData.results){
+        const title = page.properties?.['요리명']?.title?.[0]?.plain_text || page.properties?.['title']?.title?.[0]?.plain_text || '제목 없음';
+        const ing = page.properties?.['재료']?.rich_text?.map(t=>t.plain_text).join('\n') || '';
+        const steps = page.properties?.['조리법']?.rich_text?.map(t=>t.plain_text).join('\n') || '';
+        console.log(`[DB] ${title} ing:${ing.length} steps:${steps.length}`);
+        recipes.push({id:page.id,title,ingredients:ing,steps,fullContent:'',cover:'',url:page.url});
       }
-      raw=data;
-      try{ fs.writeFileSync('recipes.json',JSON.stringify(data),'utf8'); }catch(e){}
-    }else{ console.log('DB fail',JSON.stringify(data||{}).slice(0,3000)); }
+    }
   }
-  if(!raw){ try{ raw=JSON.parse(fs.readFileSync('recipes.json','utf8')); }catch(e){ raw={results:[]}; } }
-  const results=raw.results||[];
-  const recipes=results.map(page=>{
-    const title=extractText(getProp(page,'요리명'))||'제목 없음';
-    const difficulty=extractText(getProp(page,'난이도')); const status=extractText(getProp(page,'상태')); const chef=extractText(getProp(page,'세프/출처')); const time=extractText(getProp(page,'소요시간'));
-    const categories=(getProp(page,'카테고리')?.multi_select||[]).map(s=>s.name); const tags=(getProp(page,'태그')?.multi_select||[]).map(s=>s.name);
-    let ingredients=extractText(getProp(page,'재료'));
-    let steps=extractText(getProp(page,'조리법'));
-    // 쿠팡 링크도 재료/조리법이랑 비슷하게 여러 이름 시도
-    const getAny = (names)=>{ for(const n of names){ const p=getProp(page,n); const t=extractText(p)||getFiles(p); if(t) return t; } return ''; };
-    const coup1=getAny(['쿠팡제품1','쿠팡링크1','쿠팡1']); const coup2=getAny(['쿠팡제품2','쿠팡링크2','쿠팡2']); const coup3=getAny(['쿠팡제품3','쿠팡링크3','쿠팡3']);
-    const imgProp=getFiles(getProp(page,'이미지'))||getFiles(getProp(page,'사진'))||getFiles(getProp(page,'썸네일'));
-    const cover=page.cover?(page.cover.external?.url||page.cover.file?.url||''):'';
-    return {id:page.id,title,difficulty,status,chef,time,categories,tags,ingredients:ingredients||'',steps:steps||'',fullContent:'',coupang:[coup1,coup2,coup3].filter(Boolean),url:page.url,cover:cover||imgProp};
-  }).filter(r=>r.title!=='제목 없음');
+  if(recipes.length===0){
+    console.log('Trying as PAGE (folder) - listing child blocks...');
+    const parentBlocks = await notionRequest('/v1/blocks/'+parentId+'/children?page_size=100','GET',null);
+    if(parentBlocks && parentBlocks.results){
+      console.log(`Parent has ${parentBlocks.results.length} child blocks`);
+      const childPages = parentBlocks.results.filter(b=>b.type==='child_page');
+      console.log(`Found ${childPages.length} child pages`);
+      for(let i=0;i<childPages.length;i++){
+        const b=childPages[i];
+        const title=b.child_page?.title||'제목 없음';
+        const pageId=b.id;
+        console.log(`[${i+1}/${childPages.length}] ${title} id=${pageId.slice(0,8)} fetching...`);
+        const text=await fetchAllBlocks(pageId,0);
+        console.log(`  -> ${text.length} chars preview: ${text.slice(0,200).replace(/\n/g,' | ')}`);
+        // Parse sections
+        let ingredients='', seasoning='', steps='', info='';
+        // simple parsing: look for headings
+        const lines=text.split('\n');
+        let current='';
+        for(const line of lines){
+          const lower=line.toLowerCase();
+          if(line.includes('재료 준비') || line.includes('재료') && (line.includes('#') || line.startsWith('🛒') || line.startsWith('🤎') || line.length<20)){
+            current='ing'; continue;
+          }
+          if(line.includes('양념')){ current='season'; continue; }
+          if(line.includes('조리') || line.includes('만드는 법') || line.includes('순서')){ current='steps'; continue; }
+          if(line.includes('기본 정보') || line.includes('조리 시간') || line.includes('분량') || line.includes('난이도')){ current='info'; }
+          if(current==='ing') ingredients+=line+'\n';
+          else if(current==='season') seasoning+=line+'\n';
+          else if(current==='steps') steps+=line+'\n';
+          else if(current==='info') info+=line+'\n';
+        }
+        // If no sections found, use full text as ingredients+steps
+        if(!ingredients && !steps) ingredients=text;
+        recipes.push({id:pageId,title,ingredients:ingredients+(seasoning?'\n\n[양념]\n'+seasoning:''),steps:steps||'',fullContent:text,info,cover:'',url:'https://www.notion.so/'+pageId.replace(/-/g,'')});
+        await new Promise(r=>setTimeout(r,200));
+      }
+    }
+  }
   console.log('Total recipes:',recipes.length);
   if(!fs.existsSync('dist')) fs.mkdirSync('dist',{recursive:true});
   fs.writeFileSync('dist/site-data.json',JSON.stringify(recipes,null,2),'utf8');
-  const html=`<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>나의 레시피 북</title><style>*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:#fafaf7;color:#111}header{text-align:center;padding:40px 20px 20px}header h1{font-size:32px;margin:0}header p{color:#666;margin-top:8px}.controls{max-width:1100px;margin:0 auto;padding:0 20px 20px;display:flex;gap:10px;flex-wrap:wrap}.controls input,.controls select{padding:10px 14px;border:1px solid #ddd;border-radius:10px;font-size:14px}.controls input{flex:1;min-width:200px}.grid{max-width:1100px;margin:0 auto;padding:0 20px 80px;display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}.card{background:white;border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);display:flex;flex-direction:column;cursor:pointer;transition:transform .15s,box-shadow .15s}.card:hover{transform:translateY(-4px);box-shadow:0 8px 24px rgba(0,0,0,.12)}.card-cover{height:180px;background:#f1f1ef;background-size:cover;background-position:center;display:flex;align-items:center;justify-content:center;font-size:48px}.card-body{padding:16px}.badge{display:inline-block;font-size:12px;padding:4px 8px;border-radius:20px;background:#f0f0f0;margin-right:6px;margin-bottom:6px}.badge.time{background:#e8f5e9}.badge.chef{background:#e3f2fd}.badge.diff{background:#fff3e0}.title{font-size:18px;font-weight:700;margin:8px 0;line-height:1.3}.tags{margin-top:10px}.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;padding:20px}.modal-overlay.open{display:flex}.modal{background:white;border-radius:20px;max-width:720px;width:100%;max-height:90vh;overflow-y:auto;position:relative}.modal-cover{height:260px;background:#eee;background-size:cover;background-position:center}.modal-close{position:absolute;top:12px;right:12px;width:36px;height:36px;border-radius:50%;background:white;border:none;font-size:20px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.15)}.modal-body{padding:24px}.modal-body h2{margin:0 0 12px;font-size:24px}.modal-section{margin-top:20px}.modal-section h3{font-size:16px;margin:0 0 8px;border-left:4px solid #111;padding-left:8px}.modal-section pre{white-space:pre-wrap;font-family:inherit;background:#fafaf7;padding:12px;border-radius:10px;font-size:14px;line-height:1.6}.coupang a{display:inline-block;margin:6px 10px 0 0;font-size:13px;color:#fff;background:#0073e9;padding:8px 14px;border-radius:8px;text-decoration:none}.empty{grid-column:1/-1;text-align:center;padding:60px;color:#999}</style></head><body><header><h1>🍳 나의 레시피 북</h1><p>Notion에서 자동으로 업데이트됩니다 - 총 <span id="count">0</span>개 · 카드를 클릭해보세요!</p></header><div class="controls"><input id="search" placeholder="요리명, 재료, 셰프 검색..."><select id="filterChef"><option value="">세프/출처 전체</option></select><select id="filterTime"><option value="">소요시간 전체</option></select><select id="filterStatus"><option value="">상태 전체</option></select></div><div class="grid" id="grid"></div><div class="modal-overlay" id="modal"><div class="modal"><button class="modal-close" onclick="closeModal()">✕</button><div class="modal-cover" id="mCover"></div><div class="modal-body"><div id="mBadges"></div><h2 id="mTitle"></h2><div id="mTags"></div><div class="modal-section"><h3>🥕 재료</h3><pre id="mIng"></pre></div><div class="modal-section"><h3>👩‍🍳 조리법 & 상세 내용</h3><pre id="mSteps"></pre></div><div class="modal-section" id="mCoupangWrap"><h3>🛒 쿠팡 제품</h3><div id="mCoupang" class="coupang"></div></div><div style="margin-top:20px"><a id="mNotion" target="_blank" style="color:#666;font-size:13px">Notion에서 열기 →</a></div></div></div></div><script>let data=[];async function load(){try{const res=await fetch('site-data.json?v='+Date.now());data=await res.json();}catch(e){data=[];}initFilters();render();}function initFilters(){const chefs=[...new Set(data.map(d=>d.chef).filter(Boolean))];const times=[...new Set(data.map(d=>d.time).filter(Boolean))];const statuses=[...new Set(data.map(d=>d.status).filter(Boolean))];const add=(sel,list)=>{list.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;sel.appendChild(o);});};add(document.getElementById('filterChef'),chefs);add(document.getElementById('filterTime'),times);add(document.getElementById('filterStatus'),statuses);}function render(){const q=document.getElementById('search').value.toLowerCase();const chefF=document.getElementById('filterChef').value;const timeF=document.getElementById('filterTime').value;const statusF=document.getElementById('filterStatus').value;const grid=document.getElementById('grid');let filtered=data.filter(d=>{const matchQ=!q||d.title.toLowerCase().includes(q)||(d.ingredients&&d.ingredients.toLowerCase().includes(q))||(d.fullContent&&d.fullContent.toLowerCase().includes(q))||(d.chef&&d.chef.toLowerCase().includes(q));return matchQ && (!chefF||d.chef===chefF) && (!timeF||d.time===timeF) && (!statusF||d.status===statusF);});document.getElementById('count').textContent=filtered.length;if(filtered.length===0){grid.innerHTML='<div class=empty>레시피가 없습니다.</div>';return;}grid.innerHTML=filtered.map(r=>{const idx=data.indexOf(r);return \`<div class="card" onclick="openModal(\${idx})">\${r.cover ? \`<div class="card-cover" style="background-image:url('\${r.cover}')"></div>\` : \`<div class="card-cover">🍳</div>\`}<div class="card-body"><div>\${r.time? \`<span class="badge time">⏱ \${r.time}</span>\`:''} \${r.chef? \`<span class="badge chef">👨‍🍳 \${r.chef}</span>\`:''} \${r.difficulty? \`<span class="badge diff">⭐ \${r.difficulty}</span>\`:''} \${r.status? \`<span class="badge">\${r.status}</span>\`:''}</div><div class="title">\${r.title}</div><div class="tags">\${(r.categories||[]).map(c=>\`<span class="badge">\${c}</span>\`).join('')} \${(r.tags||[]).map(t=>\`<span class="badge" style="background:#f3e5f5">\${t}</span>\`).join('')}</div></div></div>\`;}).join('');}function openModal(idx){const r=data[idx];const coverEl=document.getElementById('mCover');coverEl.style.backgroundImage=r.cover? \`url('\${r.cover}')\` : '';coverEl.innerHTML=r.cover?'':'<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:64px">🍳</div>';document.getElementById('mBadges').innerHTML=\`\${r.time? \`<span class="badge time">⏱ \${r.time}</span>\`:''} \${r.chef? \`<span class="badge chef">👨‍🍳 \${r.chef}</span>\`:''} \${r.difficulty? \`<span class="badge diff">⭐ \${r.difficulty}</span>\`:''} \${r.status? \`<span class="badge">\${r.status}</span>\`:''}\`;document.getElementById('mTitle').textContent=r.title;document.getElementById('mTags').innerHTML=(r.categories||[]).map(c=>\`<span class="badge">\${c}</span>\`).join('') + (r.tags||[]).map(t=>\`<span class="badge" style="background:#f3e5f5">\${t}</span>\`).join('');document.getElementById('mIng').textContent=r.ingredients||'재료 정보 없음 - Notion에서 재료 속성을 확인하세요';document.getElementById('mSteps').textContent=r.steps||'조리법 정보 없음 - Notion에서 조리법 속성을 확인하세요';const cw=document.getElementById('mCoupangWrap');const c=document.getElementById('mCoupang');if(r.coupang&&r.coupang.length){c.innerHTML=r.coupang.map((u,i)=>\`<a href="\${u}" target="_blank">🛒 쿠팡 제품 \${i+1} 보기</a>\`).join('');cw.style.display='block';}else{cw.style.display='none';}document.getElementById('mNotion').href=r.url;document.getElementById('modal').classList.add('open');}function closeModal(){document.getElementById('modal').classList.remove('open');}document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')closeModal();});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});document.getElementById('search').addEventListener('input',render);document.getElementById('filterChef').addEventListener('change',render);document.getElementById('filterTime').addEventListener('change',render);document.getElementById('filterStatus').addEventListener('change',render);load();<\/script></body></html>`;
+  const html=`<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>나의 레시피 북</title><style>*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:#fafaf7;color:#111}header{text-align:center;padding:40px 20px 20px}header h1{font-size:32px;margin:0}header p{color:#666;margin-top:8px}.controls{max-width:1100px;margin:0 auto;padding:0 20px 20px;display:flex;gap:10px;flex-wrap:wrap}.controls input,.controls select{padding:10px 14px;border:1px solid #ddd;border-radius:10px;font-size:14px}.controls input{flex:1;min-width:200px}.grid{max-width:1100px;margin:0 auto;padding:0 20px 80px;display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}.card{background:white;border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06);display:flex;flex-direction:column;cursor:pointer;transition:transform .15s,box-shadow .15s}.card:hover{transform:translateY(-4px);box-shadow:0 8px 24px rgba(0,0,0,.12)}.card-cover{height:180px;background:#f1f1ef;background-size:cover;background-position:center;display:flex;align-items:center;justify-content:center;font-size:48px}.card-body{padding:16px}.badge{display:inline-block;font-size:12px;padding:4px 8px;border-radius:20px;background:#f0f0f0;margin-right:6px;margin-bottom:6px}.title{font-size:18px;font-weight:700;margin:8px 0;line-height:1.3}.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;padding:20px}.modal-overlay.open{display:flex}.modal{background:white;border-radius:20px;max-width:720px;width:100%;max-height:90vh;overflow-y:auto;position:relative}.modal-cover{height:260px;background:#eee;background-size:cover;background-position:center}.modal-close{position:absolute;top:12px;right:12px;width:36px;height:36px;border-radius:50%;background:white;border:none;font-size:20px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.15)}.modal-body{padding:24px}.modal-body h2{margin:0 0 12px;font-size:24px}.modal-section{margin-top:20px}.modal-section h3{font-size:16px;margin:0 0 8px;border-left:4px solid #111;padding-left:8px}.modal-section pre{white-space:pre-wrap;font-family:inherit;background:#fafaf7;padding:12px;border-radius:10px;font-size:14px;line-height:1.6}.empty{grid-column:1/-1;text-align:center;padding:60px;color:#999}</style></head><body><header><h1>🍳 나의 레시피 북</h1><p>총 <span id="count">0</span>개 · 카드를 클릭해보세요!</p></header><div class="controls"><input id="search" placeholder="요리명, 재료 검색..."></div><div class="grid" id="grid"></div><div class="modal-overlay" id="modal"><div class="modal"><button class="modal-close" onclick="closeModal()">✕</button><div class="modal-cover" id="mCover"></div><div class="modal-body"><h2 id="mTitle"></h2><div class="modal-section"><h3>🥕 재료</h3><pre id="mIng"></pre></div><div class="modal-section"><h3>👩‍🍳 조리법 & 전체 내용</h3><pre id="mSteps"></pre></div><div style="margin-top:20px"><a id="mNotion" target="_blank" style="color:#666;font-size:13px">Notion에서 열기 →</a></div></div></div></div><script>let data=[];async function load(){try{const res=await fetch('site-data.json?v='+Date.now());data=await res.json();}catch(e){data=[];}render();}function render(){const q=document.getElementById('search').value.toLowerCase();const grid=document.getElementById('grid');let filtered=data.filter(d=>!q||d.title.toLowerCase().includes(q)||(d.ingredients&&d.ingredients.toLowerCase().includes(q))||(d.fullContent&&d.fullContent.toLowerCase().includes(q)));document.getElementById('count').textContent=filtered.length;if(filtered.length===0){grid.innerHTML='<div class=empty>레시피가 없습니다.</div>';return;}grid.innerHTML=filtered.map(r=>{const idx=data.indexOf(r);return \`<div class="card" onclick="openModal(\${idx})"><div class="card-cover">🍳</div><div class="card-body"><div class="title">\${r.title}</div></div></div>\`;}).join('');}function openModal(idx){const r=data[idx];document.getElementById('mTitle').textContent=r.title;document.getElementById('mIng').textContent=r.ingredients||'재료 정보 없음';document.getElementById('mSteps').textContent=r.steps||r.fullContent||'조리법 없음';document.getElementById('mNotion').href=r.url;document.getElementById('modal').classList.add('open');}function closeModal(){document.getElementById('modal').classList.remove('open');}document.getElementById('modal').addEventListener('click',e=>{if(e.target.id==='modal')closeModal();});document.getElementById('search').addEventListener('input',render);load();<\/script></body></html>`;
   fs.writeFileSync('dist/index.html',html,'utf8'); fs.writeFileSync('index.html',html,'utf8'); console.log('done');
 }
 main();
