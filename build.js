@@ -1,5 +1,31 @@
 
 const fs = require('fs');
+const https = require('https');
+
+function notionRequest(path, method='GET', body=null){
+  const key = process.env.NOTION_API_KEY;
+  const dbId = process.env.NOTION_DB_ID;
+  if(!key || !dbId) return Promise.resolve(null);
+  return new Promise((resolve)=>{
+    const opts={
+      hostname:'api.notion.com',
+      path,
+      method,
+      headers:{
+        'Authorization':'Bearer '+key,
+        'Notion-Version':'2022-06-28',
+        'Content-Type':'application/json'
+      }
+    };
+    const req=https.request(opts, res=>{
+      let data=''; res.on('data', d=>data+=d);
+      res.on('end',()=>{ try{ resolve(JSON.parse(data)); }catch(e){ resolve({results:[]}); } });
+    });
+    req.on('error',()=>resolve({results:[]}));
+    if(body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
 
 function getProp(page, name) {
   if (!page.properties) return null;
@@ -24,17 +50,31 @@ function getFiles(prop) {
   return f.file ? f.file.url : (f.external ? f.external.url : '');
 }
 
-function main(){
-  let raw;
-  try{
-    raw = JSON.parse(fs.readFileSync('recipes.json','utf8'));
-  }catch(e){
-    console.log('recipes.json not found, using empty');
-    raw = {results:[]};
+async function main(){
+  // 1. Try fetch Notion if keys exist
+  let raw = null;
+  const dbId = process.env.NOTION_DB_ID;
+  if(dbId && process.env.NOTION_API_KEY){
+    console.log('Fetching from Notion DB:', dbId);
+    const data = await notionRequest(`/v1/databases/${dbId}/query`, 'POST', {page_size:100});
+    if(data && data.results){
+      console.log('Fetched', data.results.length);
+      raw = data;
+      fs.writeFileSync('recipes.json', JSON.stringify(data),'utf8');
+    }
   }
-  const results = raw.results || [];
-  console.log('Found', results.length, 'pages');
+  // 2. fallback to local recipes.json
+  if(!raw){
+    try{
+      raw = JSON.parse(fs.readFileSync('recipes.json','utf8'));
+      console.log('Loaded local recipes.json', raw.results?.length);
+    }catch(e){
+      console.log('No recipes.json, using empty');
+      raw = {results:[]};
+    }
+  }
 
+  const results = raw.results || [];
   const recipes = results.map(page=>{
     const title = extractText(getProp(page,'요리명')) || '제목 없음';
     const difficulty = extractText(getProp(page,'난이도'));
@@ -46,22 +86,14 @@ function main(){
     const ingredients = extractText(getProp(page,'재료'));
     const steps = extractText(getProp(page,'조리법'));
     const pageContent = page._pageContent || '';
-    
     const coup1 = extractText(getProp(page,'쿠팡제품1')) || getFiles(getProp(page,'쿠팡제품1'));
     const coup2 = extractText(getProp(page,'쿠팡제품2')) || getFiles(getProp(page,'쿠팡제품2'));
     const coup3 = extractText(getProp(page,'쿠팡제품3')) || getFiles(getProp(page,'쿠팡제품3'));
     const imgProp = getFiles(getProp(page,'이미지')) || getFiles(getProp(page,'사진'));
     const cover = page.cover ? (page.cover.external?.url || page.cover.file?.url || '') : '';
-
     return {
       id: page.id,
-      title,
-      difficulty,
-      status,
-      chef,
-      time,
-      categories,
-      tags,
+      title, difficulty, status, chef, time, categories, tags,
       ingredients: ingredients || pageContent.slice(0,800),
       steps: steps || pageContent,
       fullContent: pageContent,
@@ -73,9 +105,11 @@ function main(){
 
   if (!fs.existsSync('dist')) fs.mkdirSync('dist',{recursive:true});
   fs.writeFileSync('dist/site-data.json', JSON.stringify(recipes,null,2),'utf8');
-  console.log('Wrote', recipes.length);
+  console.log('Wrote', recipes.length, 'recipes');
 
-  const html = `<!DOCTYPE html>
+  const html = fs.readFileSync('index.html','utf8').includes('나의 레시피 북') ? fs.readFileSync('index.html','utf8') : null;
+  // generate fresh html always
+  const finalHtml = `<!DOCTYPE html>
 <html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>나의 레시피 북</title>
 <style>
@@ -173,9 +207,8 @@ document.getElementById('filterTime').addEventListener('change', render);
 document.getElementById('filterStatus').addEventListener('change', render);
 load();
 </script></body></html>`;
-
-  fs.writeFileSync('dist/index.html', html,'utf8');
-  fs.writeFileSync('index.html', html,'utf8');
+  fs.writeFileSync('dist/index.html', finalHtml,'utf8');
+  fs.writeFileSync('index.html', finalHtml,'utf8');
   console.log('done');
 }
 main();
